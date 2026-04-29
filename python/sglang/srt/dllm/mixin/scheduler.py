@@ -1,20 +1,132 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
+import os
+import re
+import time
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+import torch
+
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.mixin.req import (
+    DllmReqPhase,
+    get_rollback_state,
+    restore_rollback_state,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.utils.common import ceil_align
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+
+
+_DLLM_REQ_DEBUG_SKIPPED_ATTRS = {"tokenizer"}
+
+
+def _get_dllm_refresh_append_ids(
+    req: Req,
+    next_token_ids: List[int],
+    block_size: int,
+    denoise_req_rids: Optional[Set[str]],
+) -> List[int]:
+    if req.rid not in (denoise_req_rids or set()) or len(next_token_ids) != block_size:
+        return next_token_ids
+
+    overlap_len = (len(req.origin_input_ids) + len(req.output_ids)) % block_size
+    return next_token_ids[overlap_len:]
+
+
+def _safe_debug_repr(obj) -> str:
+    try:
+        return repr(obj)
+    except Exception as err:
+        return f"<repr failed: {type(err).__name__}: {err}>"
+
+
+def _to_debug_data(obj, seen: Optional[Set[int]] = None):
+    if seen is None:
+        seen = set()
+
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+
+    obj_id = id(obj)
+    if obj_id in seen:
+        return f"<recursive reference: {type(obj).__module__}.{type(obj).__qualname__}>"
+    seen.add(obj_id)
+
+    try:
+        if isinstance(obj, Enum):
+            return obj.value
+
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return {
+                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
+                "__dict__": {
+                    field.name: _to_debug_data(getattr(obj, field.name), seen)
+                    for field in dataclasses.fields(obj)
+                    if field.name not in _DLLM_REQ_DEBUG_SKIPPED_ATTRS
+                },
+            }
+
+        if isinstance(obj, dict):
+            return {
+                str(_to_debug_data(key, seen)): _to_debug_data(value, seen)
+                for key, value in obj.items()
+                if str(key) not in _DLLM_REQ_DEBUG_SKIPPED_ATTRS
+            }
+
+        if isinstance(obj, (list, tuple)):
+            return [_to_debug_data(item, seen) for item in obj]
+
+        if isinstance(obj, set):
+            return [
+                _to_debug_data(item, seen) for item in sorted(obj, key=_safe_debug_repr)
+            ]
+
+        if hasattr(obj, "detach") and hasattr(obj, "shape"):
+            tensor = obj.detach()
+            cpu_tensor = tensor.cpu()
+            return {
+                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "device": str(tensor.device),
+                "data": cpu_tensor.tolist(),
+            }
+
+        if hasattr(obj, "tolist") and hasattr(obj, "shape"):
+            return {
+                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
+                "dtype": str(getattr(obj, "dtype", None)),
+                "shape": list(obj.shape),
+                "data": obj.tolist(),
+            }
+
+        if hasattr(obj, "__dict__"):
+            return {
+                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
+                "__repr__": _safe_debug_repr(obj),
+                "__dict__": {
+                    key: _to_debug_data(value, seen)
+                    for key, value in vars(obj).items()
+                    if key not in _DLLM_REQ_DEBUG_SKIPPED_ATTRS
+                },
+            }
+
+        return _safe_debug_repr(obj)
+    finally:
+        seen.remove(obj_id)
 
 
 class SchedulerDllmMixin:
@@ -68,6 +180,11 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        # no matter what, clean up the update_ids first
+        for req in batch.reqs:
+            req.update_ids = None
+
+        # Fast path (refresh / refresh + prefill)
         if result.next_token_ids:
             self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -80,10 +197,17 @@ class SchedulerDllmMixin:
                     continue
 
                 req.fill_ids[-new_tokens:] = next_token_ids[:]
-                self.num_generated_tokens += new_tokens
+                append_token_ids = _get_dllm_refresh_append_ids(
+                    req,
+                    next_token_ids,
+                    batch.dllm_config.block_size,
+                    batch.denoise_req_rids,
+                )
+                append_tokens = len(append_token_ids)
+                self.num_generated_tokens += append_tokens
 
-                req.output_ids.extend(next_token_ids)
-                req.check_finished(new_accepted_len=new_tokens)
+                req.output_ids.extend(append_token_ids)
+                req.check_finished(new_accepted_len=append_tokens)
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
@@ -91,6 +215,31 @@ class SchedulerDllmMixin:
 
             self.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
+        elif (
+            result.logits_output.customized_info
+            and "updated_input_ids" in result.logits_output.customized_info
+        ):
+            # only decode path (decode)
+            updated_input_ids = result.logits_output.customized_info[
+                "updated_input_ids"
+            ]
+            for idx in range(batch.batch_size()):
+                req = batch.reqs[idx]
+                # roll back req state before prepare_for_extend
+                update_ids = updated_input_ids[idx]
+                if isinstance(update_ids, torch.Tensor):
+                    req.update_ids = update_ids.detach().to(
+                        dtype=torch.int64, device="cpu", copy=True
+                    )
+                else:
+                    req.update_ids = torch.tensor(update_ids, dtype=torch.int64)
+                if req.snapshot_state is not None:
+                    self._discard_dllm_rollback_kv(req)
+                    restore_rollback_state(req, req.snapshot_state)
+                # add latest updated input ids to request
+        else:
+            # only prefill (prefill)
+            pass
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
@@ -219,7 +368,13 @@ class SchedulerDllmMixin:
             self.spec_algorithm,
             dllm_config=self.dllm_config,
         )
+        for req in new_batch.reqs:
+            req.snapshot_state = get_rollback_state(req)
+
         new_batch.prepare_for_extend()
+
+        # LIAW DEBUG
+        # self._dump_dllm_test_req(new_batch.reqs[0], new_batch, forward_mode)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
@@ -231,6 +386,70 @@ class SchedulerDllmMixin:
         )
 
         return new_batch
+
+    def _discard_dllm_rollback_kv(self: Scheduler, req: Req) -> None:
+        state = req.snapshot_state
+        if state is None or req.req_pool_idx is None:
+            return
+
+        start = state.kv_allocated_len
+        end = req.kv_allocated_len
+        if start >= end:
+            return
+
+        if self.tree_cache.page_size > 1:
+            start = ceil_align(start, self.tree_cache.page_size)
+
+        if start >= end:
+            return
+
+        indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start:end
+        ]
+        self.token_to_kv_pool_allocator.free(indices_to_free)
+        # Keep req_pool_idx attached to this request. The next refine round will
+        # overwrite the same row, and the normal finish/abort path will free it.
+
+    def _dump_dllm_test_req(
+        self: Scheduler,
+        test_req: Req,
+        new_batch: ScheduleBatch,
+        forward_mode: ForwardMode,
+    ) -> None:
+        """Dump the first DLLM request state for each scheduled DLLM batch."""
+        dump_dir = "/sgl-workspace/sglang/sglang_dllm_req_dumps"
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+
+            dump_idx = getattr(self, "_dllm_req_dump_idx", 0) + 1
+            self._dllm_req_dump_idx = dump_idx
+            schedule_round = getattr(self, "forward_ct", 0) + 1
+            rid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(test_req.rid))[:80]
+            timestamp_us = int(time.time() * 1_000_000)
+            dump_path = os.path.join(
+                dump_dir,
+                (
+                    f"dllm_req_round_{schedule_round:08d}"
+                    f"_dump_{dump_idx:08d}"
+                    f"_rid_{rid}"
+                    f"_{timestamp_us}.json"
+                ),
+            )
+
+            payload = {
+                "schedule_round": schedule_round,
+                "dump_index": dump_idx,
+                "forward_mode": str(forward_mode),
+                "batch_size": new_batch.batch_size(),
+                "test_req_rid": test_req.rid,
+                "test_req": _to_debug_data(test_req),
+            }
+            with open(dump_path, "w", encoding="utf-8") as fout:
+                json.dump(payload, fout, indent=2, ensure_ascii=False)
+
+            logger.info("Dumped DLLM test_req state to %s", dump_path)
+        except Exception:
+            logger.exception("Failed to dump DLLM test_req state")
 
     def process_dllm_incoming_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
@@ -338,7 +557,8 @@ class DllmManager:
     def increment_chunked_count(self) -> None:
         """Increment chunked count for all staging requests."""
         for req in self.staging_queue:
-            req.is_chunked += 1
+            if req.update_ids is None:
+                req.is_chunked += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""
