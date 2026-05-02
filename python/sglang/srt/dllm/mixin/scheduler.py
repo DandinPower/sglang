@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-import json
-import logging
-import os
-import re
-import time
-from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 import torch
@@ -24,113 +17,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.utils.common import ceil_align
 
-logger = logging.getLogger(__name__)
-
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
-
-
-_DLLM_REQ_DEBUG_SKIPPED_ATTRS = {"tokenizer"}
-
-
-def _get_dllm_refresh_append_ids(
-    req: Req,
-    next_token_ids: List[int],
-    block_size: int,
-    denoise_req_rids: Set[str],
-) -> List[int]:
-    assert (
-        req.rid in denoise_req_rids
-    ), "Only denoise requests should have next_token_ids in prefill path"
-    assert (
-        len(next_token_ids) == block_size
-    ), "The length of next_token_ids should be equal to block_size for refresh path"
-
-    overlap_len = (len(req.origin_input_ids) + len(req.output_ids)) % block_size
-    return next_token_ids[overlap_len:]
-
-
-def _safe_debug_repr(obj) -> str:
-    try:
-        return repr(obj)
-    except Exception as err:
-        return f"<repr failed: {type(err).__name__}: {err}>"
-
-
-def _to_debug_data(obj, seen: Optional[Set[int]] = None):
-    if seen is None:
-        seen = set()
-
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-
-    obj_id = id(obj)
-    if obj_id in seen:
-        return f"<recursive reference: {type(obj).__module__}.{type(obj).__qualname__}>"
-    seen.add(obj_id)
-
-    try:
-        if isinstance(obj, Enum):
-            return obj.value
-
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            return {
-                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
-                "__dict__": {
-                    field.name: _to_debug_data(getattr(obj, field.name), seen)
-                    for field in dataclasses.fields(obj)
-                    if field.name not in _DLLM_REQ_DEBUG_SKIPPED_ATTRS
-                },
-            }
-
-        if isinstance(obj, dict):
-            return {
-                str(_to_debug_data(key, seen)): _to_debug_data(value, seen)
-                for key, value in obj.items()
-                if str(key) not in _DLLM_REQ_DEBUG_SKIPPED_ATTRS
-            }
-
-        if isinstance(obj, (list, tuple)):
-            return [_to_debug_data(item, seen) for item in obj]
-
-        if isinstance(obj, set):
-            return [
-                _to_debug_data(item, seen) for item in sorted(obj, key=_safe_debug_repr)
-            ]
-
-        if hasattr(obj, "detach") and hasattr(obj, "shape"):
-            tensor = obj.detach()
-            cpu_tensor = tensor.cpu()
-            return {
-                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
-                "dtype": str(tensor.dtype),
-                "shape": list(tensor.shape),
-                "device": str(tensor.device),
-                "data": cpu_tensor.tolist(),
-            }
-
-        if hasattr(obj, "tolist") and hasattr(obj, "shape"):
-            return {
-                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
-                "dtype": str(getattr(obj, "dtype", None)),
-                "shape": list(obj.shape),
-                "data": obj.tolist(),
-            }
-
-        if hasattr(obj, "__dict__"):
-            return {
-                "__class__": f"{type(obj).__module__}.{type(obj).__qualname__}",
-                "__repr__": _safe_debug_repr(obj),
-                "__dict__": {
-                    key: _to_debug_data(value, seen)
-                    for key, value in vars(obj).items()
-                    if key not in _DLLM_REQ_DEBUG_SKIPPED_ATTRS
-                },
-            }
-
-        return _safe_debug_repr(obj)
-    finally:
-        seen.remove(obj_id)
 
 
 class SchedulerDllmMixin:
@@ -216,12 +104,12 @@ class SchedulerDllmMixin:
             elif len(next_token_ids) > 0 and len(update_ids) == 0:
                 # refresh path
                 req.fill_ids[-len(next_token_ids) :] = next_token_ids[:]
-                append_token_ids = _get_dllm_refresh_append_ids(
-                    req,
-                    next_token_ids,
-                    batch.dllm_config.block_size,
-                    batch.denoise_req_rids,
-                )
+
+                overlap_len = (
+                    len(req.origin_input_ids) + len(req.output_ids)
+                ) % batch.dllm_config.block_size
+                append_token_ids = next_token_ids[overlap_len:]
+
                 append_tokens = len(append_token_ids)
                 self.num_generated_tokens += append_tokens
 
@@ -423,47 +311,6 @@ class SchedulerDllmMixin:
         self.token_to_kv_pool_allocator.free(indices_to_free)
         # Keep req_pool_idx attached to this request. The next refine round will
         # overwrite the same row, and the normal finish/abort path will free it.
-
-    def _dump_dllm_test_req(
-        self: Scheduler,
-        test_req: Req,
-        new_batch: ScheduleBatch,
-        forward_mode: ForwardMode,
-    ) -> None:
-        """Dump the first DLLM request state for each scheduled DLLM batch."""
-        dump_dir = "/sgl-workspace/sglang/sglang_dllm_req_dumps"
-        try:
-            os.makedirs(dump_dir, exist_ok=True)
-
-            dump_idx = getattr(self, "_dllm_req_dump_idx", 0) + 1
-            self._dllm_req_dump_idx = dump_idx
-            schedule_round = getattr(self, "forward_ct", 0) + 1
-            rid = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(test_req.rid))[:80]
-            timestamp_us = int(time.time() * 1_000_000)
-            dump_path = os.path.join(
-                dump_dir,
-                (
-                    f"dllm_req_round_{schedule_round:08d}"
-                    f"_dump_{dump_idx:08d}"
-                    f"_rid_{rid}"
-                    f"_{timestamp_us}.json"
-                ),
-            )
-
-            payload = {
-                "schedule_round": schedule_round,
-                "dump_index": dump_idx,
-                "forward_mode": str(forward_mode),
-                "batch_size": new_batch.batch_size(),
-                "test_req_rid": test_req.rid,
-                "test_req": _to_debug_data(test_req),
-            }
-            with open(dump_path, "w", encoding="utf-8") as fout:
-                json.dump(payload, fout, indent=2, ensure_ascii=False)
-
-            logger.info("Dumped DLLM test_req state to %s", dump_path)
-        except Exception:
-            logger.exception("Failed to dump DLLM test_req state")
 
     def process_dllm_incoming_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
