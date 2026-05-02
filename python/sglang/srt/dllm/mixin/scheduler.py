@@ -37,10 +37,14 @@ def _get_dllm_refresh_append_ids(
     req: Req,
     next_token_ids: List[int],
     block_size: int,
-    denoise_req_rids: Optional[Set[str]],
+    denoise_req_rids: Set[str],
 ) -> List[int]:
-    if req.rid not in (denoise_req_rids or set()) or len(next_token_ids) != block_size:
-        return next_token_ids
+    assert (
+        req.rid in denoise_req_rids
+    ), "Only denoise requests should have next_token_ids in prefill path"
+    assert (
+        len(next_token_ids) == block_size
+    ), "The length of next_token_ids should be equal to block_size for refresh path"
 
     overlap_len = (len(req.origin_input_ids) + len(req.output_ids)) % block_size
     return next_token_ids[overlap_len:]
@@ -180,23 +184,38 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        # no matter what, clean up the update_ids first
-        for req in batch.reqs:
+        assert (
+            len(result.next_token_ids) == batch.batch_size()
+        ), "The length of next_token_ids should be equal to batch size"
+        assert (
+            result.logits_output.customized_info is not None
+        ), "customized_info should not be None in result.logits_output for DLLM batch"
+        assert (
+            "update_ids_list" in result.logits_output.customized_info
+        ), "update_ids_list should be in customized_info of result.logits_output for DLLM batch"
+        assert (
+            len(result.logits_output.customized_info["update_ids_list"])
+            == batch.batch_size()
+        ), "The length of update_ids_list should be equal to batch size"
+
+        stream_output_reqs = []
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+        for idx, req in enumerate(batch.reqs):
+            # no matter what, clean up the update_ids first
             req.update_ids = None
 
-        # Fast path (refresh / refresh + prefill)
-        if result.next_token_ids:
-            self.token_to_kv_pool_allocator.free_group_begin()
+            next_token_ids = result.next_token_ids[idx].tolist()
+            update_ids = result.logits_output.customized_info["update_ids_list"][
+                idx
+            ].tolist()
 
-            for idx in range(batch.batch_size()):
-                req = batch.reqs[idx]
-
-                next_token_ids = result.next_token_ids[idx].tolist()
-                new_tokens = len(next_token_ids)
-                if new_tokens == 0:
-                    continue
-
-                req.fill_ids[-new_tokens:] = next_token_ids[:]
+            if len(next_token_ids) == 0 and len(update_ids) == 0:
+                # prefill path
+                continue
+            elif len(next_token_ids) > 0 and len(update_ids) == 0:
+                # refresh path
+                req.fill_ids[-len(next_token_ids) :] = next_token_ids[:]
                 append_token_ids = _get_dllm_refresh_append_ids(
                     req,
                     next_token_ids,
@@ -209,37 +228,30 @@ class SchedulerDllmMixin:
                 req.output_ids.extend(append_token_ids)
                 req.check_finished(new_accepted_len=append_tokens)
 
+                stream_output_reqs.append(req)
+
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
+            elif len(next_token_ids) == 0 and len(update_ids) > 0:
+                # decode path
+                assert (
+                    req.snapshot_state is not None
+                ), "snapshot_state should not be None for decode reqs"
+                req.update_ids = (
+                    result.logits_output.customized_info["update_ids_list"][idx]
+                    .detach()
+                    .to(dtype=torch.int64, device="cpu", copy=True)
+                )
+                self._discard_dllm_rollback_kv(req)
+                restore_rollback_state(req, req.snapshot_state)
+            else:
+                raise ValueError(
+                    "Invalid result: both next_token_ids and update_ids_list are returned, which should not happen in current design"
+                )
 
-            self.stream_output(batch.reqs, batch.return_logprob)
-            self.token_to_kv_pool_allocator.free_group_end()
-        elif (
-            result.logits_output.customized_info
-            and "updated_input_ids" in result.logits_output.customized_info
-        ):
-            # only decode path (decode)
-            updated_input_ids = result.logits_output.customized_info[
-                "updated_input_ids"
-            ]
-            for idx in range(batch.batch_size()):
-                req = batch.reqs[idx]
-                # roll back req state before prepare_for_extend
-                update_ids = updated_input_ids[idx]
-                if isinstance(update_ids, torch.Tensor):
-                    req.update_ids = update_ids.detach().to(
-                        dtype=torch.int64, device="cpu", copy=True
-                    )
-                else:
-                    req.update_ids = torch.tensor(update_ids, dtype=torch.int64)
-                if req.snapshot_state is not None:
-                    self._discard_dllm_rollback_kv(req)
-                    restore_rollback_state(req, req.snapshot_state)
-                # add latest updated input ids to request
-        else:
-            # only prefill (prefill)
-            pass
+        self.stream_output(stream_output_reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
@@ -389,19 +401,21 @@ class SchedulerDllmMixin:
 
     def _discard_dllm_rollback_kv(self: Scheduler, req: Req) -> None:
         state = req.snapshot_state
-        if state is None or req.req_pool_idx is None:
-            return
+        assert (
+            state is not None
+        ), "snapshot_state should not be None when discarding rollback kv"
+        assert (
+            req.req_pool_idx is not None
+        ), "req_pool_idx should not be None when discarding rollback kv"
 
-        start = state.kv_allocated_len
-        end = req.kv_allocated_len
-        if start >= end:
-            return
-
+        start = len(req.prefix_indices)
         if self.tree_cache.page_size > 1:
             start = ceil_align(start, self.tree_cache.page_size)
+        end = req.kv_allocated_len
 
-        if start >= end:
-            return
+        assert (
+            start <= end
+        ), f"Invalid KV range to free: start={start}, end={end}, req.rid={req.rid}"
 
         indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
             start:end
