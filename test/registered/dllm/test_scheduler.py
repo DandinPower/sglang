@@ -138,5 +138,17 @@ class TestLLaDA2MiniLowConfidenceRadixCache(BaseTestCase):
     diable_radix_cache = False
 
 
+class TestLLaDA2MiniJointThresholdRadixCache(BaseTestCase):
+    model = "inclusionAI/LLaDA2.0-mini"
+    dllm_algorithm = "JointThreshold"
+    diable_radix_cache = False
+
+
+class TestSDAR8BJointThresholdRadixCache(BaseTestCase):
+    model = "JetLM/SDAR-8B-Chat"
+    dllm_algorithm = "JointThreshold"
+    diable_radix_cache = False
+
+
 if __name__ == "__main__":
     unittest.main()

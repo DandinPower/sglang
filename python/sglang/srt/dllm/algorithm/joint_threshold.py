@@ -1,3 +1,5 @@
+from enum import Enum, auto
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,6 +11,30 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+class DllmPath(Enum):
+    REFRESH = auto()
+    PREFILL = auto()
+    DECODE = auto()
+
+
+def decide_dllm_path(
+    current_block_finished: bool, prompt_masks: torch.Tensor | None, num_masks: int
+) -> DllmPath:
+    """
+    Dispatch path logic:
+    - If current_block_finished == True, use refresh.
+    - If current_block_finished == False, prompt_masks == None, and num_masks == 0, use prefill.
+    - Otherwise, use decode.
+    """
+    if current_block_finished:
+        return DllmPath.REFRESH
+
+    if prompt_masks is None and num_masks == 0:
+        return DllmPath.PREFILL
+
+    return DllmPath.DECODE
+
+
 class JointThreshold(DllmAlgorithm):
 
     def __init__(
@@ -16,8 +42,9 @@ class JointThreshold(DllmAlgorithm):
         config: DllmConfig,
     ):
         super().__init__(config)
-        self.threshold = config.algorithm_config.get("threshold", 0.5)
-        self.edit_threshold = config.algorithm_config.get("edit_threshold", 0)
+        # Since the current model does not support edit behavior well, we tuned the threshold to match the LowConfidence behavior, which can still evaluate whether the implementation is correct. Complete testing can be done after the new model that supports edit behavior well becomes available.
+        self.threshold = config.algorithm_config.get("threshold", 0.95)
+        self.edit_threshold = config.algorithm_config.get("edit_threshold", 1)
         self.max_post_edit_steps = config.algorithm_config.get(
             "max_post_edit_steps", 16
         )
@@ -28,110 +55,140 @@ class JointThreshold(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
+        dllm_algorithm_states = forward_batch.dllm_algorithm_states
         batch_size = forward_batch.batch_size
-        device = forward_batch.input_ids.device
 
-        mask_index = forward_batch.input_ids == self.mask_id
-        if not mask_index.any():
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            return out.logits_output, [], out.can_run_graph
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
-        start_list = []
-        prompt_masks = []
-        for i in range(batch_size):
-            block_start = i * self.block_size
+        next_token_ids_list = []
+        update_ids_list = []
+
+        for batch_id in range(batch_size):
+            block_start = batch_id * self.block_size
             block_end = block_start + self.block_size
-            block_input_ids = forward_batch.input_ids[block_start:block_end]
+            block_input_ids = forward_batch.input_ids[block_start:block_end,]
+            block_mask_index = block_input_ids == self.mask_id
 
-            prompt_mask = block_input_ids != self.mask_id
-            prompt_masks.append(prompt_mask)
-            start_list.append(prompt_mask.sum().item())
+            state = dllm_algorithm_states[batch_id]
+            num_masks = block_mask_index.sum().item()
+            path = decide_dllm_path(
+                current_block_finished=state["current_block_finished"],
+                prompt_masks=state.get("prompt_masks"),
+                num_masks=num_masks,
+            )
 
-        post_edit_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
+            if path == DllmPath.REFRESH:
+                next_token_ids_list.append(block_input_ids)
+                update_ids_list.append(
+                    torch.empty(
+                        (0,),
+                        dtype=torch.int64,
+                        device=forward_batch.input_ids.device,
+                    )
+                )
+                # reset state for the next block processing
+                state["prompt_masks"] = None
+                state["current_block_finished"] = False
+                state["post_edit_steps"] = 0
+            elif path == DllmPath.PREFILL:
+                next_token_ids_list.append(
+                    torch.empty(
+                        (0,),
+                        dtype=torch.int64,
+                        device=forward_batch.input_ids.device,
+                    )
+                )
+                update_ids_list.append(
+                    torch.empty(
+                        (0,),
+                        dtype=torch.int64,
+                        device=forward_batch.input_ids.device,
+                    )
+                )
+            else:
+                # decode
+                if state["prompt_masks"] is None:
+                    # this block has never been processed, record the prompt mask
+                    prompt_mask = block_input_ids != self.mask_id
+                    state["prompt_masks"] = prompt_mask
 
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        # Controls whether to perform an additional forward pass for KV cache persistence.
-        # For certain decoding rounds where the terminal step yields no state change,
-        # this can be set to False to bypass the overhead of an idle forward pass.
-        any_changed_in_last_step = False
-
-        max_iterations = self.block_size + self.max_post_edit_steps
-        for _ in range(max_iterations):
-            if finished.all():
-                break
-
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-
-            any_changed_in_last_step = False
-
-            for i in range(batch_size):
-                if finished[i]:
-                    continue
-
-                block_start = i * self.block_size
-                block_end = block_start + self.block_size
-
-                curr_input_ids = forward_batch.input_ids[block_start:block_end]
-                curr_logits = logits_output.full_logits[block_start:block_end]
-                curr_prompt_mask = prompt_masks[i]
+                logits = logits_output.full_logits[block_start:block_end]
 
                 if self.penalty_lambda > 0:
-                    prev_ids = curr_input_ids[:-1]
-                    curr_logits[1:, :].scatter_(
+                    prev_ids = block_input_ids[:-1]
+                    logits[1:, :].scatter_(
                         1, prev_ids.unsqueeze(-1), -self.penalty_lambda, reduce="add"
                     )
 
-                x = torch.argmax(curr_logits, dim=-1)
+                x = torch.argmax(logits, dim=-1)
                 p = torch.squeeze(
                     torch.gather(
-                        F.softmax(curr_logits, dim=-1),
+                        F.softmax(logits, dim=-1),
                         dim=-1,
                         index=torch.unsqueeze(x, -1),
                     ),
                     -1,
                 )
 
-                mask_index = curr_input_ids == self.mask_id
-                has_mask = mask_index.any()
-
                 # Mask to token (M2T)
-                mask_transfer_index = torch.zeros_like(mask_index)
-                if has_mask:
-                    confidence = torch.where(mask_index, p, -np.inf)
+                mask_transfer_index = torch.zeros_like(block_mask_index)
+                if block_mask_index.any():
+                    confidence = torch.where(block_mask_index, p, -np.inf)
                     mask_transfer_index = confidence > self.threshold
 
                     if not mask_transfer_index.any():
                         _, select_index = torch.topk(confidence, k=1)
                         mask_transfer_index[select_index] = True
                 else:
-                    post_edit_steps[i] += 1
-                    if post_edit_steps[i] > self.max_post_edit_steps:
-                        finished[i] = True
-                        continue
+                    state["post_edit_steps"] += 1
 
                 # Token to token (T2T)
-                edit_mask = ~mask_index & ~curr_prompt_mask
+                edit_mask = ~block_mask_index & ~state["prompt_masks"]
                 edit_transfer_index = (
-                    (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
+                    (p > self.edit_threshold) & (block_input_ids != x) & edit_mask
                 )
 
                 transfer_index = mask_transfer_index | edit_transfer_index
-                if not transfer_index.any():
-                    finished[i] = True
-                    continue
 
-                curr_input_ids[transfer_index] = x[transfer_index]
-                any_changed_in_last_step = True
+                if not transfer_index.any() or (
+                    state["post_edit_steps"] > self.max_post_edit_steps
+                    and self.max_post_edit_steps == 0
+                ):
+                    # 1. If no token is transferred, it means this forward pass is already stable and the KV cache has been refreshed. Therefore, we can skip the later refresh steps.
+                    # 2. If post_edit_steps exceeds the maximum steps, this only happens when max_post_edit_steps is equal to zero, which means this round behaves like a refresh since we do not need post edit steps. Therefore, we can also skip the later refresh steps.
+                    next_token_ids_list.append(block_input_ids)
+                    update_ids_list.append(
+                        torch.empty(
+                            (0,),
+                            dtype=torch.int64,
+                            device=forward_batch.input_ids.device,
+                        )
+                    )
+                    state["prompt_masks"] = None
+                    state["current_block_finished"] = False
+                    state["post_edit_steps"] = 0
+                else:
+                    if (
+                        state["post_edit_steps"] == self.max_post_edit_steps
+                        and self.max_post_edit_steps > 0
+                    ):
+                        # This means the current round is the last post edit round. After this round, we should run the refresh logic in the next round.
+                        # We should prevent into this path for the max_post_edit_steps == 0 scenario, otherwise it will refresh immediately even we still at mask transferred stage.
+                        state["current_block_finished"] = True
+                    block_input_ids[transfer_index] = x[transfer_index]
+                    next_token_ids_list.append(
+                        torch.empty(
+                            (0,),
+                            dtype=torch.int64,
+                            device=forward_batch.input_ids.device,
+                        )
+                    )
+                    update_ids_list.append(block_input_ids.clone())
 
-        if any_changed_in_last_step:
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-
-        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
+        if logits_output.customized_info is None:
+            logits_output.customized_info = {}
+        logits_output.customized_info["update_ids_list"] = update_ids_list
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 
