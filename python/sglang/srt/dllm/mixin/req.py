@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -62,12 +62,26 @@ class ReqDllmMixin:
         self.dllm_config = dllm_config
         self.snapshot_state: Optional[RollBackState] = None
         self.update_ids: Optional[torch.Tensor] = None
+        self.dllm_algorithm_state: dict[str, Any] = {}
 
         if self.dllm_config is not None:
             if len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+
+            self._init_dllm_algorithm_state()
+
+    def _init_dllm_algorithm_state(self: Req):
+        assert (
+            self.dllm_config is not None
+        ), "dllm_config should not be None when initializing dllm algorithm state"
+        if self.dllm_config.algorithm == "LowConfidence":
+            self.dllm_algorithm_state = {
+                "current_block_finished": False,  # used for decide prefill or refresh in the next round
+            }
+        else:
+            raise ValueError(f"Unsupported DLLM algorithm {self.dllm_config.algorithm}")
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None

@@ -25,7 +25,7 @@ class LowConfidence(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
-        denoise_req_rids = forward_batch.denoise_req_rids or set()
+        dllm_algorithm_states = forward_batch.dllm_algorithm_states
         batch_size = forward_batch.batch_size
         assert (
             batch_size == forward_batch.input_ids.shape[0] // self.block_size
@@ -45,7 +45,7 @@ class LowConfidence(DllmAlgorithm):
 
             if sum(block_mask_index).item() == 0:
                 # no mask token in this block -> refresh path or prefill path
-                if forward_batch.rids[batch_id] in denoise_req_rids:
+                if dllm_algorithm_states[batch_id]["current_block_finished"]:
                     # refresh path
                     block_start = batch_id * self.block_size
                     block_end = block_start + self.block_size
@@ -58,6 +58,7 @@ class LowConfidence(DllmAlgorithm):
                             device=forward_batch.input_ids.device,
                         )
                     )
+                    dllm_algorithm_states[batch_id]["current_block_finished"] = False
                 else:
                     # prefill path,
                     next_token_ids_list.append(
@@ -107,6 +108,13 @@ class LowConfidence(DllmAlgorithm):
                 update_ids_list.append(
                     forward_batch.input_ids[curr_block_start:curr_block_end].clone()
                 )
+
+                block_mask_index = block_input_ids == self.mask_id
+                if sum(block_mask_index).item() == 0:
+                    assert not dllm_algorithm_states[batch_id][
+                        "current_block_finished"
+                    ], "Only the refresh path current_block_finished can be True"
+                    dllm_algorithm_states[batch_id]["current_block_finished"] = True
 
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
