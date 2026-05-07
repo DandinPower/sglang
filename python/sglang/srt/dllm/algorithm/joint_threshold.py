@@ -63,6 +63,7 @@ class JointThreshold(DllmAlgorithm):
 
         next_token_ids_list = []
         update_ids_list = []
+        fwd_counts_list = []
 
         for batch_id in range(batch_size):
             block_start = batch_id * self.block_size
@@ -71,6 +72,7 @@ class JointThreshold(DllmAlgorithm):
             block_mask_index = block_input_ids == self.mask_id
 
             state = dllm_algorithm_states[batch_id]
+            state["fwd_counts"] += 1
             num_masks = block_mask_index.sum().item()
             path = decide_dllm_path(
                 current_block_finished=state["current_block_finished"],
@@ -87,10 +89,12 @@ class JointThreshold(DllmAlgorithm):
                         device=forward_batch.input_ids.device,
                     )
                 )
+                fwd_counts_list.append(state["fwd_counts"])
                 # reset state for the next block processing
                 state["prompt_masks"] = None
                 state["current_block_finished"] = False
                 state["post_edit_steps"] = 0
+                state["fwd_counts"] = 0
             elif path == DllmPath.PREFILL:
                 next_token_ids_list.append(
                     torch.empty(
@@ -106,6 +110,9 @@ class JointThreshold(DllmAlgorithm):
                         device=forward_batch.input_ids.device,
                     )
                 )
+                # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                fwd_counts_list.append(None)
+                state["fwd_counts"] = 0
             else:
                 # decode
                 if state["prompt_masks"] is None:
@@ -165,9 +172,13 @@ class JointThreshold(DllmAlgorithm):
                             device=forward_batch.input_ids.device,
                         )
                     )
+                    # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                    fwd_counts_list.append(state["fwd_counts"])
+
                     state["prompt_masks"] = None
                     state["current_block_finished"] = False
                     state["post_edit_steps"] = 0
+                    state["fwd_counts"] = 0
                 else:
                     if (
                         state["post_edit_steps"] == self.max_post_edit_steps
@@ -185,10 +196,13 @@ class JointThreshold(DllmAlgorithm):
                         )
                     )
                     update_ids_list.append(block_input_ids.clone())
+                    # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                    fwd_counts_list.append(None)
 
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
         logits_output.customized_info["update_ids_list"] = update_ids_list
+        logits_output.customized_info["fwd_counts_list"] = fwd_counts_list
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

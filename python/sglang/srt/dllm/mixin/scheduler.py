@@ -21,6 +21,23 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 
 
+def _collect_fwd_counts(logits_output, idx: int, req: Req):
+    assert (
+        logits_output.customized_info is not None
+    ), "customized_info should not be None when collecting fwd_counts"
+    fwd_counts = logits_output.customized_info["fwd_counts_list"][idx]
+    assert (
+        fwd_counts is not None
+    ), "fwd_counts should not be None when collecting fwd_counts"
+
+    if req.customized_info is None:
+        req.customized_info = {}
+    if req.customized_info.get("dllm_forward_counts_per_block") is None:
+        req.customized_info["dllm_forward_counts_per_block"] = []
+
+    req.customized_info["dllm_forward_counts_per_block"].append(fwd_counts)
+
+
 class SchedulerDllmMixin:
     def init_diffusion_llm(self: Scheduler):
         self.dllm_config = (
@@ -116,11 +133,14 @@ class SchedulerDllmMixin:
                 req.output_ids.extend(append_token_ids)
                 req.check_finished(new_accepted_len=append_tokens)
 
+                _collect_fwd_counts(result.logits_output, idx, req)
+
                 stream_output_reqs.append(req)
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
+
             elif len(next_token_ids) == 0 and len(update_ids) > 0:
                 # decode path
                 assert (

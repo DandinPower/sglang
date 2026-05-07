@@ -36,8 +36,10 @@ class LowConfidence(DllmAlgorithm):
 
         next_token_ids_list = []
         update_ids_list = []
+        fwd_counts_list = []
 
         for batch_id in range(batch_size):
+            dllm_algorithm_states[batch_id]["fwd_counts"] += 1
             curr_block_start = batch_id * self.block_size
             curr_block_end = curr_block_start + self.block_size
             block_input_ids = forward_batch.input_ids[curr_block_start:curr_block_end,]
@@ -58,7 +60,11 @@ class LowConfidence(DllmAlgorithm):
                             device=forward_batch.input_ids.device,
                         )
                     )
+                    fwd_counts_list.append(
+                        dllm_algorithm_states[batch_id]["fwd_counts"]
+                    )
                     dllm_algorithm_states[batch_id]["current_block_finished"] = False
+                    dllm_algorithm_states[batch_id]["fwd_counts"] = 0
                 else:
                     # prefill path,
                     next_token_ids_list.append(
@@ -75,6 +81,9 @@ class LowConfidence(DllmAlgorithm):
                             device=forward_batch.input_ids.device,
                         )
                     )
+                    # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                    fwd_counts_list.append(None)
+                    dllm_algorithm_states[batch_id]["fwd_counts"] = 0
             else:
                 # normal decode path
                 curr_logits = logits_output.full_logits[
@@ -108,6 +117,8 @@ class LowConfidence(DllmAlgorithm):
                 update_ids_list.append(
                     forward_batch.input_ids[curr_block_start:curr_block_end].clone()
                 )
+                # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                fwd_counts_list.append(None)
 
                 block_mask_index = block_input_ids == self.mask_id
                 if sum(block_mask_index).item() == 0:
@@ -119,6 +130,7 @@ class LowConfidence(DllmAlgorithm):
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
         logits_output.customized_info["update_ids_list"] = update_ids_list
+        logits_output.customized_info["fwd_counts_list"] = fwd_counts_list
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 
