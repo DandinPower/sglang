@@ -79,12 +79,14 @@ class ReqDllmMixin:
         if self.dllm_config.algorithm == "LowConfidence":
             self.dllm_algorithm_state = {
                 "current_block_finished": False,  # used for decide prefill or refresh in the next round
+                "fwd_counts": 0,  # used for tracking the forward steps in current block
             }
         elif self.dllm_config.algorithm == "JointThreshold":
             self.dllm_algorithm_state = {
                 "prompt_masks": None,  # list of bool tensor indicating the prompt tokens in each block
                 "current_block_finished": False,  # used for decide prefill or refresh in the next round
                 "post_edit_steps": 0,  # used for tracking the post edit steps
+                "fwd_counts": 0,  # used for tracking the forward steps in current block
             }
         else:
             raise ValueError(f"Unsupported DLLM algorithm {self.dllm_config.algorithm}")
