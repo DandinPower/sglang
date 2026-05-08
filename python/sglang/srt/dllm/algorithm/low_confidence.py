@@ -1,3 +1,4 @@
+import time
 from typing import List, Tuple, Union
 
 import numpy as np
@@ -25,6 +26,7 @@ class LowConfidence(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+        dllm_algorithm_states = forward_batch.dllm_algorithm_states
         batch_size = forward_batch.batch_size
         # Here, the forward_batch full logits contains all the blocks
         # such as [dllm_block_size * batch_size, hidden_size]
@@ -97,6 +99,20 @@ class LowConfidence(DllmAlgorithm):
 
                 block_input_ids[transfer_index] = x[transfer_index]
 
+        current_time = time.perf_counter()
+        tbb_list = []
+        for batch_id in range(batch_size):
+            if dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"] is None:
+                # for the first time to finish a block, we don't have the last block finish time, so we cannot calculate TBB, we will start to monitor TBB from the next block.
+                tbb_list.append(-1)
+            else:
+                tbb_list.append(
+                    current_time
+                    - dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"]
+                )
+            dllm_algorithm_states[batch_id][
+                "dllm_last_block_finish_time"
+            ] = current_time
         forward_counts_per_request = [count + 1 for count in forward_counts_per_request]
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
@@ -109,6 +125,7 @@ class LowConfidence(DllmAlgorithm):
         self._attach_forward_counts_per_request(
             logits_output, forward_counts_per_request
         )
+        self._attach_time_between_block_per_request(logits_output, tbb_list)
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

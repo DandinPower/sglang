@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,8 +18,9 @@ class JointThreshold(DllmAlgorithm):
         config: DllmConfig,
     ):
         super().__init__(config)
-        self.threshold = config.algorithm_config.get("threshold", 0.5)
-        self.edit_threshold = config.algorithm_config.get("edit_threshold", 0)
+        # Since the current model does not support edit behavior well, we tuned the threshold to match the LowConfidence behavior, which can still evaluate whether the implementation is correct. Complete testing can be done after the new model that supports edit behavior well becomes available.
+        self.threshold = config.algorithm_config.get("threshold", 0.95)
+        self.edit_threshold = config.algorithm_config.get("edit_threshold", 1)
         self.max_post_edit_steps = config.algorithm_config.get(
             "max_post_edit_steps", 16
         )
@@ -28,6 +31,7 @@ class JointThreshold(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
+        dllm_algorithm_states = forward_batch.dllm_algorithm_states
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
 
@@ -144,6 +148,22 @@ class JointThreshold(DllmAlgorithm):
         self._attach_forward_counts_per_request(
             logits_output, forward_counts_per_request
         )
+
+        current_time = time.perf_counter()
+        tbb_list = []
+        for batch_id in range(batch_size):
+            if dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"] is None:
+                # for the first time to finish a block, we don't have the last block finish time, so we cannot calculate TBB, we will start to monitor TBB from the next block.
+                tbb_list.append(-1)
+            else:
+                tbb_list.append(
+                    current_time
+                    - dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"]
+                )
+            dllm_algorithm_states[batch_id][
+                "dllm_last_block_finish_time"
+            ] = current_time
+        self._attach_time_between_block_per_request(logits_output, tbb_list)
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

@@ -1480,6 +1480,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    dllm_algorithm_states: Optional[List[Dict[str, Any]]] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -1507,6 +1508,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
 
+        if dllm_config is not None:
+            dllm_algorithm_states = []
+            for req in reqs:
+                dllm_algorithm_states.append(req.dllm_algorithm_state)
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -1525,6 +1531,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
+            dllm_algorithm_states=dllm_algorithm_states,
         )
 
     def batch_size(self):
@@ -2574,6 +2581,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_pooled_hidden_states=self.return_pooled_hidden_states,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            dllm_algorithm_states=self.dllm_algorithm_states,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2777,6 +2785,7 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+    dllm_algorithm_states: Optional[List[Dict[str, Any]]] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.dllm.config import DllmConfig
 
@@ -21,12 +21,30 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.dllm_algorithm_state: dict[str, Any] = {}
 
         if self.dllm_config is not None:
             if len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+
+        self._init_dllm_algorithm_state()
+
+    def _init_dllm_algorithm_state(self: Req):
+        assert (
+            self.dllm_config is not None
+        ), "dllm_config should not be None when initializing dllm algorithm state"
+        if self.dllm_config.algorithm == "LowConfidence":
+            self.dllm_algorithm_state = {
+                "dllm_last_block_finish_time": None,  # used for tracking the last block finish time for Time Between Blocks (TBB) metric
+            }
+        elif self.dllm_config.algorithm == "JointThreshold":
+            self.dllm_algorithm_state = {
+                "dllm_last_block_finish_time": None,  # used for tracking the last block finish time for Time Between Blocks (TBB) metric
+            }
+        else:
+            raise ValueError(f"Unsupported DLLM algorithm {self.dllm_config.algorithm}")
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None

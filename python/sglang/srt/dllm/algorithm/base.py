@@ -25,4 +25,13 @@ class DllmAlgorithm:
         assert isinstance(logits_output, LogitsProcessorOutput)
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
-        logits_output.customized_info["dllm_forward_counts"] = counts
+        logits_output.customized_info["dllm_forward_counts_per_block"] = counts
+
+    @staticmethod
+    def _attach_time_between_block_per_request(
+        logits_output: LogitsProcessorOutput, times: list[int | float]
+    ):
+        assert isinstance(logits_output, LogitsProcessorOutput)
+        if logits_output.customized_info is None:
+            logits_output.customized_info = {}
+        logits_output.customized_info["dllm_time_between_blocks"] = times
