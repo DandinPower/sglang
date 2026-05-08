@@ -128,7 +128,10 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_top_logprobs",
     "output_token_ids_logprobs",
 )
-_INCREMENTAL_STREAMING_DLLM_META_INFO_KEYS = ("dllm_forward_counts_per_block",)
+_INCREMENTAL_STREAMING_DLLM_META_INFO_KEYS = (
+    "dllm_forward_counts_per_block",
+    "dllm_time_between_block",
+)
 
 
 @dataclasses.dataclass

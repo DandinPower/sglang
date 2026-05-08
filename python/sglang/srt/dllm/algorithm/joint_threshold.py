@@ -1,3 +1,4 @@
+import time
 from enum import Enum, auto
 
 import numpy as np
@@ -64,6 +65,7 @@ class JointThreshold(DllmAlgorithm):
         next_token_ids_list = []
         update_ids_list = []
         fwd_counts_list = []
+        tbb_list = []
 
         for batch_id in range(batch_size):
             block_start = batch_id * self.block_size
@@ -90,6 +92,21 @@ class JointThreshold(DllmAlgorithm):
                     )
                 )
                 fwd_counts_list.append(state["fwd_counts"])
+                current_time = time.perf_counter()
+                if (
+                    dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"]
+                    is None
+                ):
+                    # for the first time to finish a block, we don't have the last block finish time, so we cannot calculate TBB, we will start to monitor TBB from the next block.
+                    tbb_list.append(-1)
+                else:
+                    tbb_list.append(
+                        current_time
+                        - dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"]
+                    )
+                dllm_algorithm_states[batch_id][
+                    "dllm_last_block_finish_time"
+                ] = current_time
                 # reset state for the next block processing
                 state["prompt_masks"] = None
                 state["current_block_finished"] = False
@@ -111,6 +128,7 @@ class JointThreshold(DllmAlgorithm):
                     )
                 )
                 # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                tbb_list.append(None)
                 fwd_counts_list.append(None)
                 state["fwd_counts"] = 0
             else:
@@ -172,7 +190,23 @@ class JointThreshold(DllmAlgorithm):
                             device=forward_batch.input_ids.device,
                         )
                     )
-                    # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                    current_time = time.perf_counter()
+                    if (
+                        dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"]
+                        is None
+                    ):
+                        # for the first time to finish a block, we don't have the last block finish time, so we cannot calculate TBB, we will start to monitor TBB from the next block.
+                        tbb_list.append(-1)
+                    else:
+                        tbb_list.append(
+                            current_time
+                            - dllm_algorithm_states[batch_id][
+                                "dllm_last_block_finish_time"
+                            ]
+                        )
+                    dllm_algorithm_states[batch_id][
+                        "dllm_last_block_finish_time"
+                    ] = current_time
                     fwd_counts_list.append(state["fwd_counts"])
 
                     state["prompt_masks"] = None
@@ -197,12 +231,14 @@ class JointThreshold(DllmAlgorithm):
                     )
                     update_ids_list.append(block_input_ids.clone())
                     # Only monitor once per denoised block, so the timing occurs during the refresh stage, the other stage append None to indicate no monitoring.
+                    tbb_list.append(None)
                     fwd_counts_list.append(None)
 
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
         logits_output.customized_info["update_ids_list"] = update_ids_list
         logits_output.customized_info["fwd_counts_list"] = fwd_counts_list
+        logits_output.customized_info["tbb_list"] = tbb_list
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

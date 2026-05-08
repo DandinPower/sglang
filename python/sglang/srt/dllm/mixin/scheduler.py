@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
@@ -20,22 +20,37 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 
+_DLLM_LOGITS_TO_REQ_METRIC_KEYS = {
+    "fwd_counts_list": "dllm_forward_counts_per_block",
+    "tbb_list": "dllm_time_between_block",
+}
 
-def _collect_fwd_counts(logits_output, idx: int, req: Req):
+
+def _collect_metrics(
+    logits_output, idx: int, req: Req, metrics_to_collect: Dict[str, str]
+):
     assert (
         logits_output.customized_info is not None
     ), "customized_info should not be None when collecting fwd_counts"
-    fwd_counts = logits_output.customized_info["fwd_counts_list"][idx]
-    assert (
-        fwd_counts is not None
-    ), "fwd_counts should not be None when collecting fwd_counts"
 
     if req.customized_info is None:
         req.customized_info = {}
-    if req.customized_info.get("dllm_forward_counts_per_block") is None:
-        req.customized_info["dllm_forward_counts_per_block"] = []
 
-    req.customized_info["dllm_forward_counts_per_block"].append(fwd_counts)
+    for metric_key, collected_name in metrics_to_collect.items():
+        if req.customized_info.get(collected_name) is None:
+            req.customized_info[collected_name] = []
+
+        metric_list = logits_output.customized_info.get(metric_key, None)
+        assert (
+            metric_list is not None
+        ), f"{metric_key} should be in customized_info of logits_output when collecting metrics"
+
+        metric_value = metric_list[idx]
+        assert (
+            metric_value is not None
+        ), f"{metric_key} should not be None for idx {idx} when collecting metrics"
+
+        req.customized_info[collected_name].append(metric_value)
 
 
 class SchedulerDllmMixin:
@@ -102,6 +117,13 @@ class SchedulerDllmMixin:
             len(result.logits_output.customized_info["update_ids_list"])
             == batch.batch_size()
         ), "The length of update_ids_list should be equal to batch size"
+        assert (
+            len(result.logits_output.customized_info["fwd_counts_list"])
+            == batch.batch_size()
+        ), "The length of fwd_counts_list should be equal to batch size"
+        assert (
+            len(result.logits_output.customized_info["tbb_list"]) == batch.batch_size()
+        ), "The length of tbb_list should be equal to batch size"
 
         stream_output_reqs = []
 
@@ -133,7 +155,9 @@ class SchedulerDllmMixin:
                 req.output_ids.extend(append_token_ids)
                 req.check_finished(new_accepted_len=append_tokens)
 
-                _collect_fwd_counts(result.logits_output, idx, req)
+                _collect_metrics(
+                    result.logits_output, idx, req, _DLLM_LOGITS_TO_REQ_METRIC_KEYS
+                )
 
                 stream_output_reqs.append(req)
 
