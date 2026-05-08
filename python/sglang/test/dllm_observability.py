@@ -7,7 +7,7 @@ import requests
 OBSERVABILITY_MAX_NEW_TOKENS = 100
 OBSERVABILITY_SEED = 42
 FORWARD_COUNTS_KEY = "dllm_forward_counts_per_block"
-TIME_BETWEEN_BLOCK_KEY = "dllm_time_between_block"
+TIME_BETWEEN_BLOCK_KEY = "dllm_time_between_blocks"
 PROMPT_1 = (
     "Human: What is the capital of France and how is that city like. "
     "Give me 3 trivial information about that city. "

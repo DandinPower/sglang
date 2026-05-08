@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 _DLLM_LOGITS_TO_REQ_METRIC_KEYS = {
     "fwd_counts_list": "dllm_forward_counts_per_block",
-    "tbb_list": "dllm_time_between_block",
+    "tbb_list": "dllm_time_between_blocks",
 }
 
 
