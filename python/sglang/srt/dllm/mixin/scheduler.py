@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 _DLLM_LOGITS_TO_REQ_METRIC_KEYS = {
     "fwd_counts_list": "dllm_forward_counts_per_block",
-    "tbb_list": "dllm_time_between_blocks",
+    "block_completion_latency_list": "dllm_block_completion_latencies",
 }
 
 
@@ -122,8 +122,9 @@ class SchedulerDllmMixin:
             == batch.batch_size()
         ), "The length of fwd_counts_list should be equal to batch size"
         assert (
-            len(result.logits_output.customized_info["tbb_list"]) == batch.batch_size()
-        ), "The length of tbb_list should be equal to batch size"
+            len(result.logits_output.customized_info["block_completion_latency_list"])
+            == batch.batch_size()
+        ), "The length of block_completion_latency_list should be equal to batch size"
 
         stream_output_reqs = []
 
