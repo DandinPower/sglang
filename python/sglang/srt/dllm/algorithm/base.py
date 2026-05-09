@@ -34,4 +34,4 @@ class DllmAlgorithm:
         assert isinstance(logits_output, LogitsProcessorOutput)
         if logits_output.customized_info is None:
             logits_output.customized_info = {}
-        logits_output.customized_info["dllm_time_between_blocks"] = times
+        logits_output.customized_info["dllm_block_completion_latencies"] = times

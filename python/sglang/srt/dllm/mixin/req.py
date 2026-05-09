@@ -38,10 +38,12 @@ class ReqDllmMixin:
         if self.dllm_config.algorithm == "LowConfidence":
             self.dllm_algorithm_state = {
                 "dllm_last_block_finish_time": None,  # used for tracking the last block finish time for Time Between Blocks (TBB) metric
+                "scheduler_recv_time": self.time_stats.scheduler_recv_time,  # used for calculating the Time to First Block (TTFB) metric
             }
         elif self.dllm_config.algorithm == "JointThreshold":
             self.dllm_algorithm_state = {
                 "dllm_last_block_finish_time": None,  # used for tracking the last block finish time for Time Between Blocks (TBB) metric
+                "scheduler_recv_time": self.time_stats.scheduler_recv_time,  # used for calculating the Time to First Block (TTFB) metric
             }
         else:
             raise ValueError(f"Unsupported DLLM algorithm {self.dllm_config.algorithm}")

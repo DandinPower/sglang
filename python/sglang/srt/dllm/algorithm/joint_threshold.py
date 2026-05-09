@@ -150,20 +150,26 @@ class JointThreshold(DllmAlgorithm):
         )
 
         current_time = time.perf_counter()
-        tbb_list = []
+        block_completion_latency_list = []
         for batch_id in range(batch_size):
             if dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"] is None:
                 # for the first time to finish a block, we don't have the last block finish time, so we cannot calculate TBB, we will start to monitor TBB from the next block.
-                tbb_list.append(-1)
+                # instead of appending None, we append the Time to First Block (TTFB) for the first block, which is the time from scheduler recv to the first block finish
+                block_completion_latency_list.append(
+                    current_time
+                    - dllm_algorithm_states[batch_id]["scheduler_recv_time"]
+                )
             else:
-                tbb_list.append(
+                block_completion_latency_list.append(
                     current_time
                     - dllm_algorithm_states[batch_id]["dllm_last_block_finish_time"]
                 )
             dllm_algorithm_states[batch_id][
                 "dllm_last_block_finish_time"
             ] = current_time
-        self._attach_time_between_block_per_request(logits_output, tbb_list)
+        self._attach_time_between_block_per_request(
+            logits_output, block_completion_latency_list
+        )
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
 

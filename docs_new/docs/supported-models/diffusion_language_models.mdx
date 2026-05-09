@@ -131,3 +131,12 @@ Below the supported models are summarized in a table.
     </tr>
   </tbody>
 </table>
+
+## Observability Metrics
+
+For diffusion language model requests, SGLang returns additional observability fields in `meta_info`:
+
+1. `dllm_forward_counts_per_block`: the number of forward passes used to complete each generated block.
+2. `dllm_block_completion_latencies`: per-block completion latency values in seconds.
+
+For `dllm_block_completion_latencies`, the first value is the Time to First Block (TTFB), measured from when the scheduler receives the request until the first block is completed. The remaining values are Time Between Blocks (TBB), measured between consecutive completed blocks.

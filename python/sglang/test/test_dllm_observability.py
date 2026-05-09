@@ -7,7 +7,7 @@ import requests
 OBSERVABILITY_MAX_NEW_TOKENS = 100
 OBSERVABILITY_SEED = 42
 FORWARD_COUNTS_KEY = "dllm_forward_counts_per_block"
-TIME_BETWEEN_BLOCK_KEY = "dllm_time_between_blocks"
+TIME_BETWEEN_BLOCK_KEY = "dllm_block_completion_latencies"
 PROMPT_1 = (
     "Human: What is the capital of France and how is that city like. "
     "Give me 3 trivial information about that city. "
@@ -142,17 +142,11 @@ def _validate_time_between_block(
         time_between_block,
         request_index,
     )
-    first_value = validated_time_between_block[0]
-    if first_value != -1:
-        raise AssertionError(
-            f"The first {TIME_BETWEEN_BLOCK_KEY} entry"
-            f"{_request_context(request_index)} should be -1, got {first_value!r}"
-        )
 
-    for position, value in enumerate(validated_time_between_block[1:], start=1):
+    for position, value in enumerate(validated_time_between_block):
         if value <= 0:
             raise AssertionError(
-                f"Every {TIME_BETWEEN_BLOCK_KEY} entry after the first"
+                f"Every {TIME_BETWEEN_BLOCK_KEY} entry"
                 f"{_request_context(request_index)} should be > 0, got {value!r} "
                 f"at position {position}"
             )

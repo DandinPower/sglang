@@ -130,7 +130,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 _INCREMENTAL_STREAMING_DLLM_META_INFO_KEYS = (
     "dllm_forward_counts_per_block",
-    "dllm_time_between_blocks",
+    "dllm_block_completion_latencies",
 )
 
 
